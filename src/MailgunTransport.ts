@@ -1,18 +1,21 @@
-import {request as requestHttp, Agent as httpAgent} from 'http';
-import {request as requestHttps, Agent as httpsAgent} from 'https';
+import { Agent as httpAgent } from 'http';
+import { Agent as httpsAgent } from 'https';
 import FormData from 'form-data';
 
-import type {SubmitOptions} from 'form-data';
-import type {ClientRequest, IncomingMessage} from 'http';
-import type {SentMessageInfo, Transport, SendMailOptions} from 'nodemailer';
+import type { SubmitOptions } from 'form-data';
+import type { SentMessageInfo, Transport, SendMailOptions } from 'nodemailer';
 import type MailMessage from 'nodemailer/lib/mailer/mail-message';
 
-const TRANSFORM_FIELDS = {
-  replyTo: 'h:Reply-To'
-} as const;
+import { postForm } from './services/Requestly';
+
+type DoneCallback = (err: Error | null, info?: SentMessageInfo) => void;
 
 const ADDRESS_KEYS = ['from', 'to', 'cc', 'bcc', 'replyTo'] as const;
 const CONTENT_KEYS = ['subject', 'text', 'html'] as const;
+
+const TRANSFORM_FIELDS: Partial<Record<(typeof ADDRESS_KEYS)[number], string>> = {
+  replyTo: 'h:Reply-To',
+};
 
 interface Address {
   name: string;
@@ -44,10 +47,8 @@ const combineTarget = (target: Address): string => {
 };
 
 export class MailgunTransport implements Transport {
-
   private readonly requestConfig: RequestConfig;
-  private cids: Record<string, boolean> = {};
-  private isHttp: boolean;
+  private isHttpProxy: boolean;
 
   public name = 'MailgunTransport';
   public version = 'N/A';
@@ -57,13 +58,13 @@ export class MailgunTransport implements Transport {
     const targetPath = `/v3/${options.auth.domain}/messages`;
     const auth = `api:${options.auth.apiKey}`;
     const agentOptions = options.agent ? {agent: options.agent} : {};
-    this.isHttp =
-      (options.proxy && !options.proxy.protocol.startsWith('https') ) ||
-      (options.agent && options.agent instanceof httpAgent);
+    this.isHttpProxy =
+      (!!options.proxy && !options.proxy.protocol.startsWith('https') ) ||
+      (!!options.agent && options.agent instanceof httpAgent);
     // proxying via header changes as described here
     // https://stackoverflow.com/questions/3862813/how-can-i-use-an-http-proxy-with-node-js-http-client
     this.requestConfig = (!options.agent && options.proxy) ? {
-      protocol: this.isHttp ? 'http:' : 'https:',
+      protocol: this.isHttpProxy ? 'http:' : 'https:',
       host: options.proxy.host,
       port: options.proxy.port,
       path: `https://${targetHostname}${targetPath}`,
@@ -71,8 +72,8 @@ export class MailgunTransport implements Transport {
         Host: targetHostname
       },
       auth
-    } : {   // proxying via an http/https agent, i.e. node-tunnel
-      protocol: 'https:',
+    } : {   // no proxy, or proxy via an http/https agent like node-tunnel or tunnel-agent
+      protocol: 'https:',         // this refers to target, i.e. mailgun api server
       hostname: targetHostname,
       path: targetPath,
       ...agentOptions,
@@ -80,19 +81,8 @@ export class MailgunTransport implements Transport {
     };
   }
 
-  private findEmbeddedAttachments(data: SendMailOptions): void {
-    const content = (data.text || data.html) as string;
-    const matchInlineImages = [...content.matchAll(/["\[]cid:(.*?)["\]]/g)];
-
-    this.cids = matchInlineImages.reduce((result, match) => {
-      result[match[1]] = true;
-
-      return result;
-    }, {});
-  }
-
   private appendAddresses(form: FormData, data: SendMailOptions): void {
-    ADDRESS_KEYS.forEach(target => {
+    ADDRESS_KEYS.forEach((target) => {
       if (!data[target]) return;
 
       let value: string;
@@ -108,10 +98,10 @@ export class MailgunTransport implements Transport {
   }
 
   private appendContent(form: FormData, data: SendMailOptions): void {
-    CONTENT_KEYS.forEach(content => {
+    CONTENT_KEYS.forEach((content) => {
       if (!data[content]) return;
 
-      form.append(TRANSFORM_FIELDS[content] || content, data[content]);
+      form.append(content, data[content]);
     });
   }
 
@@ -119,13 +109,16 @@ export class MailgunTransport implements Transport {
     if (!Array.isArray(data.attachments)) return;
 
     data.attachments.forEach((attachment) => {
-      if (attachment.contentType.startsWith('image/') && this.cids[attachment.cid]) {
-        let buffer: Buffer = Buffer.from(attachment.content as string, attachment.encoding as BufferEncoding);
+      if (attachment.cid) {
+        const buffer: Buffer = Buffer.from(
+          attachment.content as string,
+          attachment.encoding as BufferEncoding,
+        );
 
         form.append('inline', buffer, {
           filename: attachment.cid,
           contentType: attachment.contentType,
-          knownLength: buffer.length
+          knownLength: buffer.length,
         });
       }
     });
@@ -135,77 +128,46 @@ export class MailgunTransport implements Transport {
     if (!Array.isArray(data.attachments)) return;
 
     data.attachments.forEach((attachment) => {
-      if (!(attachment.contentType.startsWith('image/') && this.cids[attachment.cid])) {
-        let buffer: Buffer = Buffer.from(attachment.content as string, attachment.encoding as BufferEncoding);
+      if (!attachment.cid) {
+        const buffer: Buffer = Buffer.from(
+          attachment.content as string,
+          attachment.encoding as BufferEncoding,
+        );
 
         form.append('attachment', buffer, {
           filename: attachment.filename || attachment.cid,
           contentType: attachment.contentType,
-          knownLength: buffer.length
+          knownLength: buffer.length,
         });
       }
     });
   }
 
-  private submitForm(form: FormData): Promise<any> {
-    return new Promise((resolve, reject) => {
-      let req: ClientRequest = (this.isHttp ? requestHttp : requestHttps)(Object.assign({
-        method: 'POST',
-        headers: form.getHeaders()
-      }, this.requestConfig));
-
-      form.pipe(req);
-
-      req.on('response', (res: IncomingMessage) => {
-        let chunks: Array<any> = [];
-
-        res.on('data', (chunk) => chunks.push(chunk));
-
-        res.on('end', () => {
-          let answer: any = Buffer.concat(chunks).toString();
-
-          if (res.statusCode === 200) {
-            resolve(answer);
-          } else {
-            reject(answer);
-          }
-        });
-
-        res.on('error', (error) => {
-          reject(error);
-        });
-      });
-
-      req.on('error', (error) => {
-        reject(error);
-      });
-    });
+  private submitForm(form: FormData): Promise<string> {
+    return postForm(this.requestConfig, form, this.isHttpProxy=false);
   }
 
-  public send(mail: MailMessage, done: (err: Error | null, info?: SentMessageInfo) => void): void {
-    setImmediate(() => {
-      mail.normalize((error, data: SendMailOptions) => {
-        if (error) return done(error);
+  public send(mail: MailMessage, done: DoneCallback): void {
+    mail.normalize((error, data) => {
+      if (error) return done(error);
+      if (!data) return done(new Error('The email data is corrapted.'));
 
-        this.findEmbeddedAttachments(data);
+      const form = new FormData();
 
-        const form = new FormData();
+      this.appendAddresses(form, data);
+      this.appendContent(form, data);
+      this.appendImages(form, data);
+      this.appendAttachments(form, data);
 
-        this.appendAddresses(form, data);
-        this.appendContent(form, data);
-        this.appendImages(form, data);
-        this.appendAttachments(form, data);
-
-        this.submitForm(form)
-          .then(() => {
-            done(null, {
-              envelope: mail.message.getEnvelope(),
-              messageId: mail.message.messageId(),
-              message: form
-            });
-          })
-          .catch((e) => done(e));
-      });
+      this.submitForm(form)
+        .then(() => {
+          done(null, {
+            envelope: mail.message.getEnvelope(),
+            messageId: mail.message.messageId(),
+            message: form,
+          });
+        })
+        .catch((e: Error) => done(e));
     });
   }
 }
